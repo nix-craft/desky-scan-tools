@@ -2,16 +2,16 @@
 """pdf-regex-strip.py - list or truly redact text matching a Python regex in a PDF.
 
 Usage:
-  pdf-regex-strip.py [options] IN.pdf REGEX            # list mode (dry run)
-  pdf-regex-strip.py [options] IN.pdf OUT.pdf REGEX    # strip mode
-  pdf-regex-strip.py --in-place [options] IN.pdf REGEX # strip, overwrite IN
-  pdf-regex-strip.py -e RE1 -e RE2 [-f FILE] IN.pdf [OUT.pdf]
+  pdf-regex-strip.py [opts] IN.pdf OUT.pdf REGEX1 [REGEX2 ...]   # strip
+  pdf-regex-strip.py --list [opts] IN.pdf REGEX1 [REGEX2 ...]    # dry run
+  pdf-regex-strip.py --in-place [opts] IN.pdf REGEX1 [...]       # strip, overwrite IN
+  -e PATTERN (repeatable) and -f FILE add more patterns (combined with
+  positionals; with -e/-f the positional regexes are optional).
 
 Strip mode removes the WHOLE LINE containing each match by default;
 use -m/--match-only to remove just the matched characters.
-Multiple patterns: repeat -e/--regex, and/or -f/--regex-file (one per line,
-blank lines and lines starting with # ignored). When -e or -f is given, the
-positionals are IN [OUT]; otherwise the last positional is the REGEX.
+-f FILE: one pattern per line, blank lines and lines starting with # ignored.
+OUT must end in .pdf (otherwise it is an error, not guessed as a regex).
 All patterns apply everywhere (page text, --span, metadata, --meta, --deep).
 
 Matching is per text line by default (lines built from PyMuPDF 'rawdict'
@@ -145,7 +145,7 @@ def has_text(doc, pages):
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("args", nargs="+", metavar="IN.pdf [OUT.pdf] REGEX")
-    ap.add_argument("--list", action="store_true", help="dry run (default when no OUT given)")
+    ap.add_argument("--list", action="store_true", help="dry run: IN.pdf REGEX... (no OUT)")
     ap.add_argument("-e", "--regex", action="append", default=[], metavar="PATTERN", help="pattern (repeatable)")
     ap.add_argument("-f", "--regex-file", action="append", default=[], metavar="FILE", help="file of patterns, one per line (# comments, blanks ignored)")
     ap.add_argument("-m", "--match-only", action="store_true", help="redact only the matched characters (default: whole line)")
@@ -165,18 +165,21 @@ def main():
     for fn in a.regex_file:
         with open(fn) as fh:
             pats += [l.rstrip("\n") for l in fh if l.strip() and not l.lstrip().startswith("#")]
-    if a.regex or a.regex_file:
-        if len(a.args) == 1: inp, out = a.args[0], None
-        elif len(a.args) == 2: inp, out = a.args
-        else: ap.error("with -e/-f give IN.pdf [OUT.pdf]")
+    rest = list(a.args); inp = rest.pop(0)
+    if not inp.lower().endswith(".pdf") and not os.path.isfile(inp):
+        ap.error("IN %r is not a .pdf file" % inp)
+    if a.list or a.in_place:
+        out = inp if (a.in_place and not a.list) else None
     else:
-        if len(a.args) == 2: inp, out, pat = a.args[0], None, a.args[1]
-        elif len(a.args) == 3: inp, out, pat = a.args
-        else: ap.error("give IN.pdf REGEX or IN.pdf OUT.pdf REGEX (or use -e/-f)")
-        pats = [pat]
+        if not rest:
+            ap.error("strip mode needs IN.pdf OUT.pdf REGEX... (use --list for a dry run)")
+        out = rest.pop(0)
+        if not out.lower().endswith(".pdf"):
+            ap.error("OUT %r does not end in .pdf - did you mean --list IN.pdf REGEX...? "
+                     "Usage: IN.pdf OUT.pdf REGEX1 [REGEX2 ...]" % out)
+    pats = rest + pats
     if not pats: ap.error("no patterns given")
     whole = not a.match_only
-    if a.in_place and out is None: out = inp
     if out and os.path.abspath(out) == os.path.abspath(inp) and not a.in_place:
         ap.error("OUT is the same as IN; use --in-place to allow that")
     listing = a.list or out is None
