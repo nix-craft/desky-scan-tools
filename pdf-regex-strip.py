@@ -5,6 +5,14 @@ Usage:
   pdf-regex-strip.py [options] IN.pdf REGEX            # list mode (dry run)
   pdf-regex-strip.py [options] IN.pdf OUT.pdf REGEX    # strip mode
   pdf-regex-strip.py --in-place [options] IN.pdf REGEX # strip, overwrite IN
+  pdf-regex-strip.py -e RE1 -e RE2 [-f FILE] IN.pdf [OUT.pdf]
+
+Strip mode removes the WHOLE LINE containing each match by default;
+use -m/--match-only to remove just the matched characters.
+Multiple patterns: repeat -e/--regex, and/or -f/--regex-file (one per line,
+blank lines and lines starting with # ignored). When -e or -f is given, the
+positionals are IN [OUT]; otherwise the last positional is the REGEX.
+All patterns apply everywhere (page text, --span, metadata, --meta, --deep).
 
 Matching is per text line by default (lines built from PyMuPDF 'rawdict'
 characters, so match offsets map to exact character boxes). --span joins
@@ -79,7 +87,13 @@ def fmt(r): return "(%.1f,%.1f,%.1f,%.1f)" % tuple(r)
 def short(s, n=160):
     s = s.replace("\n", "\\n"); return s if len(s) <= n else s[:n] + "..."
 
-def scan_other(doc, rx, pages, deep):
+def scan_other(doc, rxs, pages, deep):
+    out = []
+    for pi, rx in enumerate(rxs):
+        out += [(pi,) + t for t in scan_other1(doc, rx, pages, deep)]
+    return out
+
+def scan_other1(doc, rx, pages, deep):
     """Return list of (where, value, matches)."""
     found = []
     def chk(where, val):
@@ -132,7 +146,10 @@ def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("args", nargs="+", metavar="IN.pdf [OUT.pdf] REGEX")
     ap.add_argument("--list", action="store_true", help="dry run (default when no OUT given)")
-    ap.add_argument("--whole-line", action="store_true", help="redact the whole line containing each match")
+    ap.add_argument("-e", "--regex", action="append", default=[], metavar="PATTERN", help="pattern (repeatable)")
+    ap.add_argument("-f", "--regex-file", action="append", default=[], metavar="FILE", help="file of patterns, one per line (# comments, blanks ignored)")
+    ap.add_argument("-m", "--match-only", action="store_true", help="redact only the matched characters (default: whole line)")
+    ap.add_argument("--whole-line", action="store_true", help="no-op; whole-line is now the default")
     ap.add_argument("--fill", action="store_true", help="paint redacted areas white (default: no fill box)")
     ap.add_argument("--images", choices=["none", "pixels", "remove"], default="none",
                     help="images under redactions: none (default), pixels = blank those pixels (scans), remove = drop overlapping images")
@@ -144,16 +161,31 @@ def main():
     ap.add_argument("--ocr", action="store_true", help="OCR pages with no text using ocrmypdf first (if installed)")
     ap.add_argument("--in-place", action="store_true", help="allow OUT to be IN (or write back to IN)")
     a = ap.parse_args()
-    if len(a.args) == 2: inp, out, pat = a.args[0], None, a.args[1]
-    elif len(a.args) == 3: inp, out, pat = a.args
-    else: ap.error("give IN.pdf REGEX or IN.pdf OUT.pdf REGEX")
+    pats = list(a.regex)
+    for fn in a.regex_file:
+        with open(fn) as fh:
+            pats += [l.rstrip("\n") for l in fh if l.strip() and not l.lstrip().startswith("#")]
+    if a.regex or a.regex_file:
+        if len(a.args) == 1: inp, out = a.args[0], None
+        elif len(a.args) == 2: inp, out = a.args
+        else: ap.error("with -e/-f give IN.pdf [OUT.pdf]")
+    else:
+        if len(a.args) == 2: inp, out, pat = a.args[0], None, a.args[1]
+        elif len(a.args) == 3: inp, out, pat = a.args
+        else: ap.error("give IN.pdf REGEX or IN.pdf OUT.pdf REGEX (or use -e/-f)")
+        pats = [pat]
+    if not pats: ap.error("no patterns given")
+    whole = not a.match_only
     if a.in_place and out is None: out = inp
     if out and os.path.abspath(out) == os.path.abspath(inp) and not a.in_place:
         ap.error("OUT is the same as IN; use --in-place to allow that")
     listing = a.list or out is None
     flags = re.IGNORECASE if a.ignore_case else 0
     if a.span: flags |= re.MULTILINE
-    rx = re.compile(pat, flags)
+    rxs = [re.compile(x, flags) for x in pats]
+    print("Patterns (%s mode):" % ("whole-line" if whole else "match-only"))
+    for i, x in enumerate(pats): print("  [%d] %s" % (i + 1, x))
+    print()
 
     src, tmpdir = inp, None
     doc = pymupdf.open(src)
@@ -175,27 +207,38 @@ def main():
         empty = has_text(doc, pages)
         if empty: print("Note: %d page(s) have no extractable text (scans?) - consider --ocr" % len(empty), file=sys.stderr)
 
-    total = 0
+    total = 0; pcount = [0] * len(rxs); ocount = [0] * len(rxs)
     print("== Page text matches ==")
     page_hits = {}
     for p in pages:
-        hits = find_page_hits(doc[p], rx, a.span)
+        hits = []
+        for pi, rx in enumerate(rxs):
+            for h in find_page_hits(doc[p], rx, a.span):
+                h["pi"] = pi; hits.append(h)
         page_hits[p] = hits
         for h in hits:
-            total += 1
-            print("p%d  %-30r  bbox=%s\n      line: %s" % (p + 1, short(h["text"], 60),
+            total += 1; pcount[h["pi"]] += 1
+            print("p%d  [%d] %-30r  bbox=%s\n      line: %s" % (p + 1, h["pi"] + 1, short(h["text"], 60),
                   " ".join(fmt(r) for r in h["rects"]), short(h["line"])))
     print("\n== Other places ==")
-    other = scan_other(doc, rx, pages, a.deep or listing and a.deep)
-    for where, val, ms in other:
-        print("%s: %d hit(s) %r\n      value: %s" % (where, len(ms), [short(m, 40) for m in ms[:5]], short(val)))
+    other = scan_other(doc, rxs, pages, a.deep or listing and a.deep)
+    for pi, where, val, ms in other:
+        ocount[pi] += len(ms)
+        print("[%d] %s: %d hit(s) %r\n      value: %s" % (pi + 1, where, len(ms), [short(m, 40) for m in ms[:5]], short(val)))
     if a.deep:
         print("  (deep hits are raw PDF syntax; text in content streams is often hex/kerned so may not match even if visible)")
-    nother = sum(len(m) for _, _, m in other)
+    nother = sum(len(m) for *_, m in other)
     print("\nSummary: %d page-text match(es) on %d page(s); %d match(es) in %d other location(s)."
           % (total, sum(1 for h in page_hits.values() if h), nother, len(other)))
+    for i in range(len(rxs)):
+        print("  [%d] %d page-text, %d other  %s" % (i + 1, pcount[i], ocount[i], short(pats[i], 60)))
     if listing:
+        print("(strip mode would redact %s)" % ("whole lines" if whole else "matched text only"))
         return 0
+    def sub(v):
+        for rx in rxs: v = rx.sub("", v)
+        return v
+    def srch(v): return any(rx.search(v) for rx in rxs)
 
     # ---- strip mode ----
     img = {"none": pymupdf.PDF_REDACT_IMAGE_NONE, "pixels": pymupdf.PDF_REDACT_IMAGE_PIXELS,
@@ -206,29 +249,29 @@ def main():
         if not hits: continue
         page = doc[p]
         for h in hits:
-            for r in (h["lines"] if a.whole_line else h["rects"]):
+            for r in (h["lines"] if whole else h["rects"]):
                 if r.is_empty: continue
                 page.add_redact_annot(r, fill=fill); nred += 1
         page.apply_redactions(images=img, graphics=pymupdf.PDF_REDACT_LINE_ART_NONE)
     changed_meta = []
     if a.meta:
         md = doc.metadata or {}
-        new = {k: (rx.sub("", v) if isinstance(v, str) else v) for k, v in md.items()}
+        new = {k: (sub(v) if isinstance(v, str) else v) for k, v in md.items()}
         if new != md:
             doc.set_metadata({k: v for k, v in new.items() if k not in ("format", "encryption")}); changed_meta.append("Info dict")
         xmp = doc.get_xml_metadata()
-        if xmp and rx.search(xmp):
-            doc.set_xml_metadata(rx.sub("", xmp)); changed_meta.append("XMP")
+        if xmp and srch(xmp):
+            doc.set_xml_metadata(sub(xmp)); changed_meta.append("XMP")
         toc = doc.get_toc(simple=False); n = 0
         for e in toc:
-            if rx.search(e[1]): e[1] = rx.sub("", e[1]); n += 1
+            if srch(e[1]): e[1] = sub(e[1]); n += 1
         if n: doc.set_toc(toc); changed_meta.append("%d outline title(s)" % n)
         n = 0
         for p in pages:
             for an in doc[p].annots() or []:
                 info = an.info; ch = False
                 for k in ("content", "title", "subject"):
-                    if info.get(k) and rx.search(info[k]): info[k] = rx.sub("", info[k]); ch = True
+                    if info.get(k) and srch(info[k]): info[k] = sub(info[k]); ch = True
                 if ch: an.set_info(info); an.update(); n += 1
         if n: changed_meta.append("%d annotation(s)" % n)
     if out == inp:
@@ -237,7 +280,7 @@ def main():
     else:
         doc.save(out, garbage=3, deflate=True); doc.close()
     print("\nChanged: %d redaction area(s)%s on %d page(s)%s -> %s"
-          % (nred, " (whole lines)" if a.whole_line else "", sum(1 for h in page_hits.values() if h),
+          % (nred, " (whole lines)" if whole else " (match only)", sum(1 for h in page_hits.values() if h),
              ("; meta: " + ", ".join(changed_meta)) if changed_meta else ("; meta: nothing" if a.meta else ""), out))
     if other and not a.meta:
         print("Note: %d non-page-text hit(s) left untouched (use --meta)." % len(other))
