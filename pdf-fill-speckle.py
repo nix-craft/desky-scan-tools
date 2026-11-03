@@ -23,6 +23,7 @@ Usage: pdf-fill-speckle.py IN OUT [--max-hole N] [--surround R] [--density D]
                            [--no-bumps] [--edge-passes N]
 """
 import argparse, os, subprocess, sys, tempfile
+sys.stdout.reconfigure(line_buffering=True); sys.stderr.reconfigure(line_buffering=True)
 import numpy as np
 from PIL import Image
 from scipy import ndimage as ndi
