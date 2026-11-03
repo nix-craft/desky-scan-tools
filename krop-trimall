@@ -1,6 +1,12 @@
 #!/bin/sh
 # Patched krop 0.6.0 with "Trim Margins on all pages" (see ~/src/krop-trimall)
 if [ -f /run/.containerenv ] || [ -n "$CONTAINER_ID" ]; then
-  exec host-spawn env PYTHONPATH="$HOME/src/krop-trimall" /usr/bin/python3 -m krop "$@"
+  # host-spawn uses the host desktop's environment, so pass our display through
+  set -- env PYTHONPATH="$HOME/src/krop-trimall" \
+    ${DISPLAY:+DISPLAY="$DISPLAY"} ${XAUTHORITY:+XAUTHORITY="$XAUTHORITY"} \
+    ${QT_QPA_PLATFORM:+QT_QPA_PLATFORM="$QT_QPA_PLATFORM"} \
+    /usr/bin/python3 -m krop "$@"
+  [ -n "$SSH_CONNECTION" ] && set -- env -u WAYLAND_DISPLAY "$@"
+  exec host-spawn "$@"
 fi
 PYTHONPATH="$HOME/src/krop-trimall" exec /usr/bin/python3 -m krop "$@"
