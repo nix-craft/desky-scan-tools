@@ -53,3 +53,16 @@ def test_dct_gray(tmp_path):
     pdf = pikepdf.open(out); xo = pdf.pages[0].Resources.XObject.Im0
     assert xo.ColorSpace == N.DeviceGray and xo.Filter == N.DCTDecode
     assert Image.open(io.BytesIO(xo.read_raw_bytes())).mode == "L"
+
+def test_bits4_levels_and_shared(tmp_path):
+    src, out = str(tmp_path / "a.pdf"), str(tmp_path / "b.pdf")
+    g = ((np.arange(61 * 81).reshape(61, 81) % 16) * 17).astype(np.uint8)   # odd width
+    noisy = np.clip(g.astype(int) + np.random.default_rng(0).integers(-8, 9, g.shape), 0, 255).astype(np.uint8)
+    mk(src, np.dstack([noisy] * 3)); p2g.main(["--bits", "4", src, out])
+    pdf = pikepdf.open(out)
+    assert len({pg.Resources.XObject.Im0.objgen for pg in pdf.pages}) == 1
+    xo = pdf.pages[0].Resources.XObject.Im0
+    assert int(xo.BitsPerComponent) == 4 and xo.ColorSpace == N.DeviceGray
+    pix = pymupdf.open(out)[0].get_pixmap(colorspace=pymupdf.csGRAY)
+    r = np.frombuffer(pix.samples, np.uint8).reshape(pix.height, pix.width)
+    assert (r == g).all()          # noise within +-8 snaps back to the 16 levels
