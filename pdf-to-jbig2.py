@@ -33,8 +33,10 @@ for i, page in enumerate(doc):
         cache[x] = im; print(f"page {i+1}: xref {x} {bw.size} thresh {t} {len(jb)//1024} KiB", flush=True)
     else: print(f"page {i+1}: reuse xref {x}", flush=True)
     r = page.rect; pw, ph = r.width, r.height
+    b = page.get_image_rects(x)[0]               # keep original placement
+    cm = f"{b.width:.3f} 0 0 {b.height:.3f} {b.x0:.3f} {ph - b.y1:.3f} cm"
     pg = pikepdf.Dictionary(Type=pikepdf.Name.Page, MediaBox=[0, 0, pw, ph],
         Resources=pikepdf.Dictionary(XObject=pikepdf.Dictionary(Im0=cache[x])),
-        Contents=pikepdf.Stream(out, f"q {pw:.3f} 0 0 {ph:.3f} 0 0 cm /Im0 Do Q".encode()))
+        Contents=pikepdf.Stream(out, f"q {cm} /Im0 Do Q".encode()))
     out.pages.append(pikepdf.Page(pg))
 out.docinfo["/Producer"] = "pdf-to-jbig2.py"; out.save(out_path)
