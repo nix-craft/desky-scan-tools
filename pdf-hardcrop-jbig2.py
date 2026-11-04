@@ -1,4 +1,7 @@
 #!/usr/bin/env python3
+# NOTE (2026-11-04): superseded by pdf-hardcrop.py, which keeps each image's
+# encoding, keeps the page content stream, and handles multiple/shared images.
+# This old script binarizes (dithers) and rebuilds pages; kept for now only.
 """Hard-crop 1bpp scan pages: cut hidden pixels out of each image using the
 page geometry from a krop/Ghostscript-cropped copy, re-encode as lossless
 JBIG2 (generic region, no symbol mode), and size each page to its new image.
