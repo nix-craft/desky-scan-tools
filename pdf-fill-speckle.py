@@ -20,7 +20,9 @@ PNG/TIFF in -> PNG/TIFF out (TIFF written with Group 4).
 Usage: pdf-fill-speckle.py IN OUT [--max-hole N] [--surround R] [--density D]
                            [--window W] [--dpi D] [--dry-run]
                            [--no-edges] [--edge-min-run N] [--edge-max-notch N]
-                           [--no-bumps] [--edge-passes N]
+                           [--no-bumps] [--edge-passes N] [-j N]
+PDF pages are processed in parallel (-j, default os.cpu_count(); -j 1 serial);
+output is identical for any -j.
 """
 import argparse, os, subprocess, sys, tempfile
 sys.stdout.reconfigure(line_buffering=True); sys.stderr.reconfigure(line_buffering=True)
@@ -121,6 +123,18 @@ def process(img, a, dpi):
 def to_img(black):
     return Image.fromarray(~black).convert("1")
 
+def _work(job):
+    """Worker: decode -> process -> jbig2 encode. Returns (key, stats, jb bytes)."""
+    key, mode, size, raw, dpi, a, tmp = job
+    im = Image.frombytes(mode, size, raw)
+    out, black, ch = process(im, a, dpi)
+    jb = None
+    if not a.dry_run:
+        pp = f"{tmp}/p{key[0]}_{os.getpid()}.png"; to_img(out).save(pp)
+        jb = subprocess.run(["jbig2", "-p", pp], check=True, capture_output=True).stdout
+        os.remove(pp)
+    return key, (im.width, im.height, dpi, ch, a._st[1], a._st[2]), jb
+
 def main():
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("inp"); p.add_argument("out", nargs="?")
@@ -135,6 +149,7 @@ def main():
     p.add_argument("--no-bumps", action="store_true", help="don't remove 1-px black bumps on straight edges")
     p.add_argument("--edge-passes", type=int, default=2, help="edge passes (default 2)")
     p.add_argument("--dry-run", action="store_true")
+    p.add_argument("-j", "--jobs", type=int, default=os.cpu_count() or 1, help="worker processes (default cpu count; 1 = serial)")
     a = p.parse_args()
     if not a.dry_run and not a.out: p.error("OUT required unless --dry-run")
     if a.out and os.path.abspath(a.out) == os.path.abspath(a.inp): p.error("refusing to overwrite input")
@@ -143,30 +158,41 @@ def main():
         from pikepdf import PdfImage
         pdf = pikepdf.open(a.inp)
         tmp = tempfile.mkdtemp(dir=os.path.expanduser("~"))
-        seen = set(); total = 0; tot_e = [0, 0]
+        seen = set(); total = 0; tot_e = [0, 0]; jobs = []; xos = {}
         for pn, page in enumerate(pdf.pages, 1):
             W = float(page.mediabox[2]) - float(page.mediabox[0])
             for name, xo in page.images.items():
                 if xo.objgen in seen: continue
                 seen.add(xo.objgen)
                 if int(xo.get("/BitsPerComponent", 0)) != 1:
-                    print(f"page {pn} {name}: not 1bpp, skipped"); continue
+                    jobs.append(((pn, name), None)); continue
                 im = PdfImage(xo).as_pil_image()
                 dpi = a.dpi or im.width / (W / 72.0)
-                out, black, ch = process(im, a, dpi)
-                total += ch
-                print(f"page {pn} {name}: {im.width}x{im.height} ~{dpi:.0f}dpi, filled {ch} px, edge +{a._st[1]} -{a._st[2]} px")
-                tot_e[0]+=a._st[1]; tot_e[1]+=a._st[2]
-                if a.dry_run: continue
-                pp = f"{tmp}/p{pn}.png"; to_img(out).save(pp)
-                jb = subprocess.run(["jbig2", "-p", pp], check=True, capture_output=True).stdout
-                for k in ("/DecodeParms", "/JBIG2Globals", "/Decode"):
-                    if k in xo: del xo[k]
-                xo.write(jb, filter=pikepdf.Name.JBIG2Decode)
-                xo.ColorSpace = pikepdf.Name.DeviceGray; xo.BitsPerComponent = 1
-                os.remove(pp)
+                xos[(pn, name)] = xo
+                jobs.append(((pn, name), ((pn, name), im.mode, im.size, im.tobytes(), dpi, a, tmp)))
+        work = [j for _, j in jobs if j is not None]
+        if a.jobs > 1 and len(work) > 1:
+            import multiprocessing as mp
+            pool = mp.get_context("fork").Pool(min(a.jobs, len(work)))
+            results = pool.imap(_work, work)
+        else:
+            pool = None; results = map(_work, work)
+        for key, j in jobs:
+            pn, name = key
+            if j is None:
+                print(f"page {pn} {name}: not 1bpp, skipped"); continue
+            k, (w, h, dpi, ch, ad, rm), jb = next(results)
+            total += ch; tot_e[0] += ad; tot_e[1] += rm
+            print(f"page {pn} {name}: {w}x{h} ~{dpi:.0f}dpi, filled {ch} px, edge +{ad} -{rm} px")
+            if jb is None: continue
+            xo = xos[k]
+            for kk in ("/DecodeParms", "/JBIG2Globals", "/Decode"):
+                if kk in xo: del xo[kk]
+            xo.write(jb, filter=pikepdf.Name.JBIG2Decode)
+            xo.ColorSpace = pikepdf.Name.DeviceGray; xo.BitsPerComponent = 1
+        if pool: pool.close(); pool.join()
         print(f"total filled: {total} px, edge added {tot_e[0]} px, edge removed {tot_e[1]} px")
-        if not a.dry_run: pdf.save(a.out)
+        if not a.dry_run: pdf.save(a.out, deterministic_id=True)
         os.rmdir(tmp)
     else:
         im = Image.open(a.inp)
@@ -177,4 +203,4 @@ def main():
             o = to_img(out)
             if a.out.lower().endswith((".tif", ".tiff")): o.save(a.out, compression="group4", dpi=(dpi, dpi))
             else: o.save(a.out, dpi=(dpi, dpi))
-main()
+if __name__ == "__main__": main()
