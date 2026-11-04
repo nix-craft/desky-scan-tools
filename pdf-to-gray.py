@@ -17,7 +17,13 @@ Content streams, page boxes and matrices are not touched.
 DCT) are quantized to the nearest of 16 levels (multiples of 17) and written as
 4-bit DeviceGray Flate (zlib 9, PNG predictor tried, smallest kept); max/mean
 error vs the decoded source is reported per image.
-Usage: pdf-to-gray.py [--dct-tol N] [--bits 8|4] SOURCE.pdf OUTPUT.pdf
+--palette (with --bits 4, LOSSY): non-neutral RGB images are snapped per channel
+to the 16-level grid and written as /Indexed /DeviceRGB, Flate: 4-bit if <= 16
+colors, else 8-bit if <= 256.  With more than 256 colors (or to reach <= 16),
+colors covering < --min-frac of pixels (default 1e-4) are mapped to the
+nearest kept color; pixels changed and max error are reported.
+Usage: pdf-to-gray.py [--dct-tol N] [--bits 8|4] [--palette [--min-frac F]]
+                      SOURCE.pdf OUTPUT.pdf
 """
 import argparse, io, os, subprocess, sys, zlib
 import numpy as np, pikepdf
@@ -55,7 +61,41 @@ def why_skip4(o):
     if f not in (["/FlateDecode"], ["/DCTDecode"]): return f"filters {f}"
     return None
 
-def convert4(o, dct_tol):
+def flate_best(rows, bpc, w):
+    cands = [(zlib.compress(rows.tobytes(), 9), None)]
+    for f in (1, 2):
+        cands.append((zlib.compress(png_predict(rows, f), 9),
+                      pikepdf.Dictionary(Predictor=15, Colors=1, BitsPerComponent=bpc, Columns=w)))
+    return min(cands, key=lambda c: len(c[0]))
+
+def palettize(rgb, min_frac):
+    """rgb uint8 (h,w,3) -> (indices uint8 (h,w), palette list of (r,g,b) 0..255, stats)."""
+    q = ((rgb.astype(np.uint16) + 8) // 17)                      # 0..15 per channel
+    code = (q[..., 0] << 8) | (q[..., 1] << 4) | q[..., 2]       # 12-bit color id
+    cnt = np.bincount(code.ravel(), minlength=4096)
+    used = np.flatnonzero(cnt); order = used[np.argsort(-cnt[used], kind="stable")]
+    total = code.size; ncolors = len(order)
+    if ncolors <= 256: keep = order
+    else: keep = order[cnt[order] >= min_frac * total][:256]
+    if 16 < len(keep):                        # try 4-bit if only rare colors push it over
+        k16 = order[cnt[order] >= min_frac * total]
+        if len(k16) <= 16: keep = k16
+    kc = np.stack([(keep >> 8) & 15, (keep >> 4) & 15, keep & 15], 1).astype(np.int32)
+    lut = np.zeros(4096, np.uint8)
+    lut[keep] = np.arange(len(keep))
+    rest = np.setdiff1d(used, keep)
+    if len(rest):
+        rc = np.stack([(rest >> 8) & 15, (rest >> 4) & 15, rest & 15], 1).astype(np.int32)
+        d = ((rc[:, None, :] - kc[None, :, :]) ** 2).sum(-1)
+        lut[rest] = np.argmin(d, 1)
+    idx = lut[code]
+    pal = kc * 17
+    err = np.abs(pal[idx].astype(np.int16) - rgb).max()
+    changed = int(cnt[rest].sum()) if len(rest) else 0
+    return idx, pal.astype(np.uint8), dict(colors_snapped=ncolors, palette=len(keep),
+                                           remapped_px=changed, max_err=int(err))
+
+def convert4(o, dct_tol, palette=False, min_frac=1e-4):
     old = len(o.read_raw_bytes())
     r = why_skip4(o)
     if r: return "skip", "-", old, old, r
@@ -72,7 +112,18 @@ def convert4(o, dct_tol):
         b = a.astype(np.int16)
         cd = int(max(np.abs(b[..., 0] - b[..., 1]).max(), np.abs(b[..., 1] - b[..., 2]).max()))
         tol = 0 if kind == "flate" else dct_tol
-        if cd > tol: return "skip", kind, old, old, f"real color (chroma diff {cd})"
+        if cd > tol:
+            if not palette: return "skip", kind, old, old, f"real color (chroma diff {cd})"
+            idx, pal, st = palettize(np.ascontiguousarray(a), min_frac)
+            bpc = 4 if len(pal) <= 16 else 8
+            rows = np.ascontiguousarray(pack4(idx)) if bpc == 4 else idx
+            data, parms = flate_best(rows, bpc, w)
+            if "/DecodeParms" in o: del o["/DecodeParms"]
+            o.write(data, filter=N.FlateDecode, decode_parms=parms)
+            o.ColorSpace = pikepdf.Array([N.Indexed, N.DeviceRGB, len(pal) - 1, pikepdf.String(pal.tobytes())])
+            o.BitsPerComponent = bpc
+            return "ok", "palette", old, len(data), (f"Indexed {bpc}-bit, {st['palette']} colors "
+                f"(of {st['colors_snapped']} snapped), remapped {st['remapped_px']} px, max err {st['max_err']}")
         g = a[..., 1]
     else: g = a[..., 0]
     q = ((g.astype(np.uint16) + 8) // 17).astype(np.uint8)          # nearest of 0..15
@@ -140,15 +191,18 @@ def main(argv=None):
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("src"); p.add_argument("out")
     p.add_argument("--dct-tol", type=int, default=2)
+    p.add_argument("--palette", action="store_true", help="with --bits 4: Indexed RGB for color images (lossy)")
+    p.add_argument("--min-frac", type=float, default=1e-4, help="palette: colors below this pixel fraction are remapped")
     p.add_argument("--bits", type=int, choices=(8, 4), default=8, help="8 = lossless (default); 4 = lossy 16-level")
     a = p.parse_args(argv)
+    if a.palette and a.bits != 4: p.error("--palette requires --bits 4")
     if os.path.abspath(a.src) == os.path.abspath(a.out): p.error("refusing to overwrite input")
     if os.path.exists(a.out): p.error(f"{a.out} exists; refusing to overwrite")
     pdf = pikepdf.open(a.src)
     tot = {}; skipped = 0
     for o in pdf.objects:
         if not isinstance(o, pikepdf.Stream) or o.get("/Subtype") != N.Image: continue
-        st, kind, old, new, info = (convert4 if a.bits == 4 else convert)(o, a.dct_tol)
+        st, kind, old, new, info = (convert4(o, a.dct_tol, a.palette, a.min_frac) if a.bits == 4 else convert(o, a.dct_tol))
         print(f"obj {o.objgen[0]}: {int(o.Width)}x{int(o.Height)} {kind} {st} {old} -> {new} ({info})", flush=True)
         if st == "skip": skipped += 1; continue
         t = tot.setdefault(kind, [0, 0, 0]); t[0] += 1; t[1] += old; t[2] += new

@@ -66,3 +66,43 @@ def test_bits4_levels_and_shared(tmp_path):
     pix = pymupdf.open(out)[0].get_pixmap(colorspace=pymupdf.csGRAY)
     r = np.frombuffer(pix.samples, np.uint8).reshape(pix.height, pix.width)
     assert (r == g).all()          # noise within +-8 snaps back to the 16 levels
+
+def _color_img(ncol, h=50, w=71):
+    rng = np.random.default_rng(1)
+    pal = rng.integers(0, 16, (ncol, 3)) * 17
+    idx = rng.integers(0, ncol, (h, w))
+    return pal[idx].astype(np.uint8)
+
+def _render(path, i=0):
+    pix = pymupdf.open(path)[i].get_pixmap(colorspace=pymupdf.csRGB, alpha=False)
+    return np.frombuffer(pix.samples, np.uint8).reshape(pix.height, pix.width, 3)
+
+def test_palette_4bit_exact_shared(tmp_path):
+    src, out = str(tmp_path / "a.pdf"), str(tmp_path / "b.pdf")
+    rgb = _color_img(12); mk(src, rgb, pages=2)
+    p2g.main(["--bits", "4", "--palette", src, out])
+    pdf = pikepdf.open(out)
+    assert len({pg.Resources.XObject.Im0.objgen for pg in pdf.pages}) == 1
+    xo = pdf.pages[0].Resources.XObject.Im0
+    assert xo.ColorSpace[0] == N.Indexed and int(xo.BitsPerComponent) == 4
+    assert (_render(out) == rgb).all() and (_render(out, 1) == rgb).all()
+
+def test_palette_8bit_and_rare_remap(tmp_path):
+    src, out = str(tmp_path / "a.pdf"), str(tmp_path / "b.pdf")
+    rgb = _color_img(40).copy(); mk(src, rgb, pages=1)
+    p2g.main(["--bits", "4", "--palette", src, out])
+    pdf = pikepdf.open(out); xo = pdf.pages[0].Resources.XObject.Im0
+    assert int(xo.BitsPerComponent) == 8 and (_render(out) == rgb).all()
+    idx, pal, st = p2g.palettize(np.dstack([np.full((100, 100), 255, np.uint8)] * 3), 1e-4)
+    assert st["palette"] == 1
+    big = np.zeros((100, 100, 3), np.uint8); big[0, 0] = (17, 0, 0)  # 1 rare px among 2 colors? -> <=256, kept
+    assert p2g.palettize(big, 0.5)[2]["remapped_px"] == 0
+    many = (np.arange(300 * 3).reshape(300, 1, 3) % 16 * 17).astype(np.uint8)
+    many = np.repeat(np.concatenate([many, np.zeros((5000, 1, 3), np.uint8)]), 2, 1)
+    i2, p2, s2 = p2g.palettize(many, 0.01)
+    assert s2["palette"] <= 256 and s2["remapped_px"] > 0
+
+def test_palette_requires_bits4(tmp_path):
+    import pytest
+    with pytest.raises(SystemExit):
+        p2g.main(["--palette", "a.pdf", str(tmp_path / "b.pdf")])
