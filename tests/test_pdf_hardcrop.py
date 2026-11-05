@@ -52,7 +52,7 @@ def add_page(pdf, content, xobjs, crop=None, media=(0, 0, 612, 792), fonts=None)
 
 def run(tmp_path, pdf):
     i, o = tmp_path / "in.pdf", tmp_path / "out.pdf"
-    pdf.save(i)
+    pdf.save(i, stream_decode_level=pikepdf.StreamDecodeLevel.none, compress_streams=False)
     st = hc.main([str(i), str(o), "-q"]).stats
     return i, o, st
 
@@ -188,12 +188,13 @@ def test_flipped(tmp_path):
     assert st["cropped"] == 1
     assert_same_render(i, o)
 
-def test_rotated_skipped(tmp_path):
+def test_rotated_fully_visible(tmp_path):
+    # 45-degree placement whose visible area covers the whole image: kept, not skipped
     pdf = pikepdf.new()
     add_page(pdf, "q 300 300 -300 300 300 100 cm /Im0 Do Q",
              {"/Im0": flate_img(pdf, pattern(300, 300, seed=9))}, CROP)
     i, o, st = run(tmp_path, pdf)
-    assert st["skipped"] == 1 and st["cropped"] == 0
+    assert st["skipped"] == 0 and st["cropped"] == 0 and st["kept"] == 1
     assert_same_render(i, o)
 
 def test_form_nesting(tmp_path):
@@ -221,4 +222,229 @@ def test_smask(tmp_path):
     i, o, st = run(tmp_path, pdf)
     d, ims = images(o)
     assert int(ims[0].SMask.Width) == int(ims[0].Width)
+    assert_same_render(i, o)
+
+
+# ------------------------------------------------ extended image types
+import base64
+def raw_rgb_stream(pdf, im, filt, enc, parms=None):
+    st = Stream(pdf, enc)
+    st.Type, st.Subtype = Name.XObject, Name.Image
+    st.Width, st.Height = im.size; st.BitsPerComponent = 8
+    st.ColorSpace = Name.DeviceRGB if im.mode == "RGB" else Name.DeviceGray
+    st.Filter = filt
+    if parms is not None: st.DecodeParms = parms
+    return pdf.make_indirect(st)
+
+def check_pixels(i, o, name="/Im0"):
+    """Cropped samples must equal the matching region of the original, bit for bit."""
+    sd = pikepdf.open(i); d = pikepdf.open(o)
+    src = sd.pages[0].images[name]
+    x = list(d.pages[0].images.values())[0]
+    W, H = int(src.Width), int(src.Height); w, h = int(x.Width), int(x.Height)
+    cm = [k for k in pikepdf.parse_content_stream(d.pages[0]) if str(k.operator) == "cm"][-1]
+    L = round(float(cm.operands[4]) * W); T = H - round((float(cm.operands[5]) + float(cm.operands[3])) * H)
+    n = 3 if src.ColorSpace == Name.DeviceRGB else 1
+    S = pikepdf.StreamDecodeLevel.specialized
+    A = np.frombuffer(src.read_bytes(decode_level=S), np.uint8).reshape(H, W, n)
+    B = np.frombuffer(x.read_bytes(decode_level=S), np.uint8).reshape(h, w, n)
+    assert np.array_equal(A[T:T+h, L:L+w], B)
+    return d, x
+
+def test_lzw(tmp_path):
+    pdf = pikepdf.new(); im = pattern(612, 792, seed=20)
+    p = Dictionary(Predictor=12, Colors=3, BitsPerComponent=8, Columns=612)
+    add_page(pdf, "q 612 0 0 792 0 0 cm /Im0 Do Q",
+             {"/Im0": raw_rgb_stream(pdf, im, Name.LZWDecode,
+                                     hc.lzw_encode(hc.pred_encode(im.tobytes(), p)), p)}, CROP)
+    i, o, st = run(tmp_path, pdf)
+    assert st["cropped"] == 1
+    d, x = check_pixels(i, o)
+    assert x.Filter == Name.LZWDecode and int(x.DecodeParms.Predictor) == 12
+    assert int(x.DecodeParms.Columns) == int(x.Width)
+    assert_same_render(i, o, dpi=72)
+
+def test_lzw_early0_tiff_predictor(tmp_path):
+    pdf = pikepdf.new(); im = pattern(612, 792, seed=21)
+    p = Dictionary(Predictor=2, Colors=3, BitsPerComponent=8, Columns=612, EarlyChange=0)
+    add_page(pdf, "q 612 0 0 792 0 0 cm /Im0 Do Q",
+             {"/Im0": raw_rgb_stream(pdf, im, Name.LZWDecode,
+                                     hc.lzw_encode(hc.pred_encode(im.tobytes(), p), 0), p)}, CROP)
+    i, o, st = run(tmp_path, pdf)
+    d, x = check_pixels(i, o)
+    assert st["cropped"] == 1 and int(x.DecodeParms.EarlyChange) == 0
+
+def test_runlength(tmp_path):
+    pdf = pikepdf.new(); im = pattern(612, 792, "L", seed=22)
+    add_page(pdf, "q 612 0 0 792 0 0 cm /Im0 Do Q",
+             {"/Im0": raw_rgb_stream(pdf, im, Name.RunLengthDecode, hc.rl_encode(im.tobytes()))}, CROP)
+    i, o, st = run(tmp_path, pdf)
+    assert st["cropped"] == 1
+    d, x = check_pixels(i, o); assert x.Filter == Name.RunLengthDecode
+    assert_same_render(i, o, dpi=72)
+
+def test_filter_chain_raw(tmp_path):
+    pdf = pikepdf.new(); im = pattern(612, 792, seed=23)
+    p = Dictionary(Predictor=15, Colors=3, BitsPerComponent=8, Columns=612)
+    enc = base64.a85encode(zlib.compress(hc.pred_encode(im.tobytes(), p))) + b"~>"
+    add_page(pdf, "q 612 0 0 792 0 0 cm /Im0 Do Q",
+             {"/Im0": raw_rgb_stream(pdf, im, Array([Name.ASCII85Decode, Name.FlateDecode]),
+                                     enc, Array([None, p]))}, CROP)
+    i, o, st = run(tmp_path, pdf)
+    assert st["cropped"] == 1
+    d, x = check_pixels(i, o)
+    assert list(x.Filter) == [Name.ASCII85Decode, Name.FlateDecode]
+    assert int(x.DecodeParms[1].Columns) == int(x.Width)
+
+def test_filter_chain_dct(tmp_path):
+    pdf = pikepdf.new(); im = pattern(612, 792, seed=24)
+    b = io.BytesIO(); im.save(b, "JPEG", quality=85)
+    add_page(pdf, "q 612 0 0 792 0 0 cm /Im0 Do Q",
+             {"/Im0": raw_rgb_stream(pdf, im, Array([Name.ASCIIHexDecode, Name.DCTDecode]),
+                                     b.getvalue().hex().encode() + b">")}, CROP)
+    i, o, st = run(tmp_path, pdf)
+    assert st["cropped"] == 1
+    d, ims = images(o); x = ims[0]
+    assert list(x.Filter) == [Name.ASCIIHexDecode, Name.DCTDecode]
+    jpg = bytes.fromhex(x.read_raw_bytes().rstrip(b">").decode())
+    assert jpg[:2] == b"\xff\xd8" and hc.jpeg_size(jpg) == (int(x.Width), int(x.Height))
+    assert_same_render(i, o, dpi=72)
+
+def ccitt_stream(pdf, bw, tmp, k):
+    p = os.path.join(tmp, "g.tif")
+    info = {278: bw.size[1]}
+    bw.save(p, "TIFF", compression="group4" if k < 0 else "group3", tiffinfo=info)
+    t = Image.open(p); off, cnt = t.tag_v2[273], t.tag_v2[279]
+    off = off[0] if isinstance(off, tuple) else off; cnt = cnt[0] if isinstance(cnt, tuple) else cnt
+    st = Stream(pdf, open(p, "rb").read()[off:off+cnt])
+    st.Type, st.Subtype = Name.XObject, Name.Image
+    st.Width, st.Height = bw.size; st.BitsPerComponent = 1; st.ColorSpace = Name.DeviceGray
+    st.Filter = Name.CCITTFaxDecode
+    st.DecodeParms = Dictionary(K=k, Columns=bw.size[0], Rows=bw.size[1], BlackIs1=True)
+    return pdf.make_indirect(st)
+
+@pytest.mark.parametrize("k", [-1, 0])
+def test_ccitt(tmp_path, k):
+    pdf = pikepdf.new()
+    bw = pattern(1224, 1584, "L", seed=25).point(lambda v: 255 if v > 128 else 0).convert("1")
+    src = ccitt_stream(pdf, bw, str(tmp_path), k)
+    ref = hc.ccitt_decode(pdf, src.read_raw_bytes(), src.DecodeParms, 1224, 1584)
+    add_page(pdf, "q 612 0 0 792 0 0 cm /Im0 Do Q", {"/Im0": src}, CROP)
+    i, o, st = run(tmp_path, pdf)
+    assert st["cropped"] == 1
+    d, ims = images(o); x = ims[0]
+    assert x.Filter == Name.CCITTFaxDecode and int(x.DecodeParms.K) == k
+    w, h = int(x.Width), int(x.Height)
+    assert w < 1224 and h < 1584 and int(x.DecodeParms.Columns) == w
+    got = hc.ccitt_decode(d, x.read_raw_bytes(), x.DecodeParms, w, h)
+    cm = [c for c in pikepdf.parse_content_stream(d.pages[0]) if str(c.operator) == "cm"][-1]
+    L = round(float(cm.operands[4]) * 1224); T = 1584 - round((float(cm.operands[5]) + float(cm.operands[3])) * 1584)
+    assert np.array_equal(ref[T:T+h, L:L+w], got)
+    assert_same_render(i, o, dpi=144)
+
+def test_ccitt_g4_byte_aligned_skipped(tmp_path):
+    pdf = pikepdf.new()
+    bw = pattern(612, 792, "L", seed=26).point(lambda v: 255 if v > 128 else 0).convert("1")
+    src = ccitt_stream(pdf, bw, str(tmp_path), -1); src.DecodeParms.EncodedByteAlign = True
+    add_page(pdf, "q 612 0 0 792 0 0 cm /Im0 Do Q", {"/Im0": src}, CROP)
+    i, o, st = run(tmp_path, pdf)
+    assert st["skipped"] == 1 and st["cropped"] == 0
+
+@pytest.mark.parametrize("ext", ["j2k", "jp2"])
+def test_jpx_tiles(tmp_path, ext):
+    pdf = pikepdf.new(); im = pattern(640, 832, seed=27)
+    b = io.BytesIO(); im.save(b, "JPEG2000", tile_size=(128, 128), irreversible=True,
+                             quality_mode="rates", quality_layers=[20], no_jp2=(ext == "j2k"))
+    st = raw_rgb_stream(pdf, im, Name.JPXDecode, b.getvalue())
+    add_page(pdf, "q 612 0 0 792 0 0 cm /Im0 Do Q", {"/Im0": st}, CROP)
+    i, o, s = run(tmp_path, pdf)
+    assert s["cropped"] == 1
+    d, ims = images(o); x = ims[0]
+    assert x.Filter == Name.JPXDecode
+    w, h = int(x.Width), int(x.Height)
+    assert w <= 640 and h < 832
+    A = np.asarray(Image.open(io.BytesIO(b.getvalue()))); B = np.asarray(Image.open(io.BytesIO(x.read_raw_bytes())))
+    cm = [c for c in pikepdf.parse_content_stream(d.pages[0]) if str(c.operator) == "cm"][-1]
+    L = round(float(cm.operands[4]) * 640); T = 832 - round((float(cm.operands[5]) + float(cm.operands[3])) * 832)
+    assert L % 128 == 0 and T % 128 == 0           # tile boundaries
+    assert np.array_equal(A[T:T+h, L:L+w], B)      # no re-encoding: identical pixels
+    assert_same_render(i, o)
+
+def test_jpx_single_tile_skipped(tmp_path):
+    pdf = pikepdf.new(); im = pattern(400, 400, seed=28)
+    b = io.BytesIO(); im.save(b, "JPEG2000", no_jp2=True)
+    add_page(pdf, "q 612 0 0 792 0 0 cm /Im0 Do Q",
+             {"/Im0": raw_rgb_stream(pdf, im, Name.JPXDecode, b.getvalue())}, CROP)
+    i, o, s = run(tmp_path, pdf)
+    assert s["skipped"] == 1 and s["cropped"] == 0
+
+def test_inline_partly_visible(tmp_path):
+    pdf = pikepdf.new(); im = pattern(64, 80, seed=29)
+    data = zlib.compress(im.tobytes()).hex().encode() + b">"
+    content = (b"q 612 0 0 792 0 0 cm BI /W 64 /H 80 /BPC 8 /CS /RGB /F [/AHx /Fl] ID\n" + data + b"\nEI Q")
+    pg = Dictionary(Type=Name.Page, MediaBox=Array([0, 0, 612, 792]), CropBox=Array(list(CROP)),
+                    Resources=Dictionary(), Contents=pdf.make_stream(content))
+    pdf.pages.append(pikepdf.Page(pg))
+    i, o, st = run(tmp_path, pdf)
+    assert st["cropped"] == 1
+    d = pikepdf.open(o)
+    ii = [c.iimage for c in pikepdf.parse_content_stream(d.pages[0]) if isinstance(c, pikepdf.ContentStreamInlineImage)]
+    assert len(ii) == 1 and ii[0].width < 64 and ii[0].height < 80
+    assert [hc.FULL.get(str(f), str(f)) for f in ii[0].filters] == ["/ASCIIHexDecode", "/FlateDecode"]
+    assert_same_render(i, o)
+
+def test_inline_named_colorspace(tmp_path):
+    pdf = pikepdf.new(); im = pattern(64, 80, "L", seed=30)
+    content = (b"q 612 0 0 792 0 0 cm BI /W 64 /H 80 /BPC 8 /CS /Cs0 /F /AHx ID\n" + im.tobytes().hex().encode() + b">\nEI Q")
+    pg = Dictionary(Type=Name.Page, MediaBox=Array([0, 0, 612, 792]), CropBox=Array(list(CROP)),
+                    Resources=Dictionary(ColorSpace=Dictionary(Cs0=Name.DeviceGray)),
+                    Contents=pdf.make_stream(content))
+    pdf.pages.append(pikepdf.Page(pg))
+    i, o, st = run(tmp_path, pdf)
+    assert st["cropped"] == 1
+    assert_same_render(i, o)
+
+@pytest.mark.parametrize("cm", ["519.6 300 -300 519.6 250 50",      # rotated 30 degrees
+                                "612 0 200 792 -100 0"])           # skewed
+def test_rotated_skewed_cropped(tmp_path, cm):
+    pdf = pikepdf.new()
+    add_page(pdf, f"q {cm} cm /Im0 Do Q", {"/Im0": flate_img(pdf, pattern(600, 600, seed=31))},
+             (200, 300, 400, 500))
+    i, o, st = run(tmp_path, pdf)
+    assert st["cropped"] == 1 and st["skipped"] == 0
+    d, ims = images(o)
+    assert int(ims[0].Width) < 600 and int(ims[0].Height) < 600
+    assert_same_render(i, o)
+
+def test_smask_different_grid(tmp_path):
+    pdf = pikepdf.new(); x = flate_img(pdf, pattern(612, 792, seed=32))
+    m = flate_img(pdf, pattern(306, 396, "L", seed=33))
+    x.SMask = m
+    add_page(pdf, "q 612 0 0 792 0 0 cm /Im0 Do Q", {"/Im0": x}, CROP)
+    i, o, st = run(tmp_path, pdf)
+    assert st["cropped"] == 1
+    d, ims = images(o); y = ims[0]
+    assert int(y.Width) == 2 * int(y.SMask.Width) and int(y.Height) == 2 * int(y.SMask.Height)
+    assert int(y.Width) < 612
+    assert_same_render(i, o, dpi=72)
+
+def test_smask_odd_grid(tmp_path):
+    # 612 vs 204 (ratio 3) and 792 vs 264: common grid 1/204, 1/264
+    pdf = pikepdf.new(); x = flate_img(pdf, pattern(612, 792, seed=34))
+    x.SMask = flate_img(pdf, pattern(204, 264, "L", seed=35))
+    add_page(pdf, "q 612 0 0 792 0 0 cm /Im0 Do Q", {"/Im0": x}, (101, 151, 499, 699))
+    i, o, st = run(tmp_path, pdf)
+    d, ims = images(o); y = ims[0]
+    assert st["cropped"] == 1
+    assert int(y.Width) == 3 * int(y.SMask.Width) and int(y.Height) == 3 * int(y.SMask.Height)
+    assert_same_render(i, o)
+
+def test_smask_jpeg_on_flate(tmp_path):
+    pdf = pikepdf.new(); x = dct_img(pdf, pattern(640, 800, seed=36))
+    x.SMask = flate_img(pdf, pattern(320, 400, "L", seed=37))
+    add_page(pdf, "q 612 0 0 792 0 0 cm /Im0 Do Q", {"/Im0": x}, CROP)
+    i, o, st = run(tmp_path, pdf)
+    d, ims = images(o); y = ims[0]
+    assert st["cropped"] == 1 and y.Filter == Name.DCTDecode
+    assert int(y.Width) == 2 * int(y.SMask.Width) and int(y.Height) == 2 * int(y.SMask.Height)
     assert_same_render(i, o)
