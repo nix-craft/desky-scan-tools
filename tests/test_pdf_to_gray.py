@@ -1,7 +1,7 @@
 import importlib.util, io, pathlib, zlib, numpy as np, pikepdf, pymupdf
 from PIL import Image
 spec = importlib.util.spec_from_file_location("p2g", pathlib.Path(__file__).parent.parent / "pdf-to-gray.py")
-p2g = importlib.util.module_from_spec(spec); spec.loader.exec_module(p2g)
+p2g = importlib.util.module_from_spec(spec); import sys; sys.modules["p2g"] = p2g; spec.loader.exec_module(p2g)
 N = pikepdf.Name
 
 def mk(path, rgb, pages=3, dct=False):
@@ -106,3 +106,63 @@ def test_palette_requires_bits4(tmp_path):
     import pytest
     with pytest.raises(SystemExit):
         p2g.main(["--palette", "a.pdf", str(tmp_path / "b.pdf")])
+
+def _mixed(tmp_path):
+    pdf = pikepdf.new(); rng = np.random.default_rng(1)
+    for i in range(5):
+        g = (rng.integers(0, 16, (40, 50)) * 17).astype(np.uint8)
+        rgb = np.dstack([g] * 3) if i % 2 else np.dstack([g, g // 2, g // 3]).astype(np.uint8)
+        b = io.BytesIO(); Image.fromarray(rgb).save(b, "JPEG", quality=92) if i == 4 else None
+        xo = pikepdf.Stream(pdf, b.getvalue() if i == 4 else zlib.compress(rgb.tobytes()))
+        xo.Filter = N.DCTDecode if i == 4 else N.FlateDecode
+        xo.Type = N.XObject; xo.Subtype = N.Image; xo.Width = 50; xo.Height = 40
+        xo.ColorSpace = N.DeviceRGB; xo.BitsPerComponent = 8
+        pdf.pages.append(pikepdf.Page(pikepdf.Dictionary(Type=N.Page, MediaBox=[0, 0, 50, 40],
+            Resources=pikepdf.Dictionary(XObject=pikepdf.Dictionary(Im0=xo)),
+            Contents=pikepdf.Stream(pdf, b"q 50 0 0 40 0 0 cm /Im0 Do Q"))))
+    p = str(tmp_path / "m.pdf"); pdf.save(p); return p
+
+def test_parallel_identical_to_serial(tmp_path):
+    src = _mixed(tmp_path)
+    for args in (["--bits", "8"], ["--bits", "4"], ["--bits", "4", "--palette"]):
+        a, b = str(tmp_path / "s.pdf"), str(tmp_path / "p.pdf")
+        p2g.main(args + ["-j", "1", src, a]); p2g.main(args + ["-j", "4", src, b])
+        assert open(a, "rb").read() == open(b, "rb").read()
+        import os; os.remove(a); os.remove(b)
+
+def test_max_err_skips(tmp_path):
+    src = str(tmp_path / "a.pdf"); out = str(tmp_path / "b.pdf")
+    g = (np.arange(4000).reshape(40, 100) % 256).astype(np.uint8)   # off-grid levels, err up to 8
+    mk(src, np.dstack([g] * 3), pages=1); p2g.main(["--bits", "4", "--max-err", "3", src, out])
+    q = pikepdf.open(out); assert q.pages[0].Resources.XObject.Im0.ColorSpace == N.DeviceRGB
+
+def test_smask_parent_converted_mask_kept(tmp_path):
+    """Parent with /SMask converts; soft-mask stays 8-bit; Matte shrinks to 1 comp."""
+    src, out = str(tmp_path / "a.pdf"), str(tmp_path / "b.pdf")
+    pdf = pikepdf.new()
+    g = ((np.arange(40 * 50).reshape(40, 50) % 16) * 17).astype(np.uint8)
+    rgb = np.dstack([g, g, g])
+    # soft mask: mostly opaque (255) with a transparent corner
+    alpha = np.full((40, 50), 255, np.uint8); alpha[:5, :5] = 0
+    sm = pikepdf.Stream(pdf, zlib.compress(alpha.tobytes()))
+    sm.Type = N.XObject; sm.Subtype = N.Image; sm.Width = 50; sm.Height = 40
+    sm.ColorSpace = N.DeviceGray; sm.BitsPerComponent = 8; sm.Filter = N.FlateDecode
+    sm.Matte = [1, 1, 1]
+    xo = pikepdf.Stream(pdf, zlib.compress(rgb.tobytes()))
+    xo.Type = N.XObject; xo.Subtype = N.Image; xo.Width = 50; xo.Height = 40
+    xo.ColorSpace = N.DeviceRGB; xo.BitsPerComponent = 8; xo.Filter = N.FlateDecode
+    xo.SMask = sm
+    pdf.pages.append(pikepdf.Page(pikepdf.Dictionary(Type=N.Page, MediaBox=[0, 0, 50, 40],
+        Resources=pikepdf.Dictionary(XObject=pikepdf.Dictionary(Im0=xo)),
+        Contents=pikepdf.Stream(pdf, b"q 50 0 0 40 0 0 cm /Im0 Do Q"))))
+    pdf.save(src)
+    p2g.main(["--bits", "4", "-j", "1", src, out])
+    q = pikepdf.open(out); parent = q.pages[0].Resources.XObject.Im0
+    assert parent.ColorSpace == N.DeviceGray and int(parent.BitsPerComponent) == 4
+    assert "/SMask" in parent
+    sm2 = parent.SMask
+    assert int(sm2.BitsPerComponent) == 8 and sm2.ColorSpace == N.DeviceGray
+    assert list(sm2.Matte) == [1]
+    # soft-mask pixels unchanged
+    a2 = np.frombuffer(sm2.read_bytes(), np.uint8).reshape(40, 50)
+    assert (a2 == alpha).all()

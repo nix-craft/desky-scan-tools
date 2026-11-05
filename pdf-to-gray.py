@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Losslessly convert neutral RGB image XObjects in a PDF to 8-bit DeviceGray.
 
-An image is converted only if it is /DeviceRGB, 8 bpc, has no /SMask, /Mask,
+An image is converted only if it is /DeviceRGB, 8 bpc, has no /Mask,
 /Decode or /ImageMask, uses a single FlateDecode or DCTDecode filter, and its
 decoded pixels are neutral:
   Flate: R==G==B for every pixel (exact) -> one channel, zlib level 9, also
@@ -13,6 +13,9 @@ decoded pixels are neutral:
          original's G channel is reported.
 Streams are rewritten in place, each object once, so shared images stay shared.
 Content streams, page boxes and matrices are not touched.
+Images that carry /SMask are converted; the soft-mask stream itself is left
+unchanged (still 8-bit) so alpha stays smooth, and if its /Matte has 3
+components it is reduced to 1 after the parent becomes DeviceGray.
 --bits 4 (LOSSY, separate mode): neutral RGB or 8-bit DeviceGray images (Flate or
 DCT) are quantized to the nearest of 16 levels (multiples of 17) and written as
 4-bit DeviceGray Flate (zlib 9, PNG predictor tried, smallest kept); max/mean
@@ -22,7 +25,10 @@ to the 16-level grid and written as /Indexed /DeviceRGB, Flate: 4-bit if <= 16
 colors, else 8-bit if <= 256.  With more than 256 colors (or to reach <= 16),
 colors covering < --min-frac of pixels (default 1e-4) are mapped to the
 nearest kept color; pixels changed and max error are reported.
-Usage: pdf-to-gray.py [--dct-tol N] [--bits 8|4] [--palette [--min-frac F]]
+Images are processed in parallel (-j, default = cores); output is
+byte-identical to -j 1.  --max-err N (with --bits 4) leaves any image whose
+max error would exceed N unchanged.
+Usage: pdf-to-gray.py [-j N] [--max-err N] [--dct-tol N] [--bits 8|4] [--palette [--min-frac F]]
                       SOURCE.pdf OUTPUT.pdf
 """
 import argparse, io, os, subprocess, sys, zlib
@@ -52,7 +58,7 @@ def pack4(q):
     return (q[:, 0::2] << 4) | q[:, 1::2]
 
 def why_skip4(o):
-    for k in ("/SMask", "/Mask", "/Decode"):
+    for k in ("/Mask", "/Decode"):
         if k in o: return f"has {k}"
     if o.get("/ImageMask", False): return "image mask"
     if o.get("/ColorSpace") not in (N.DeviceRGB, N.DeviceGray): return f"colorspace {o.get('/ColorSpace')!r}"[:60]
@@ -145,7 +151,7 @@ def filters(o):
     return [str(x) for x in f] if isinstance(f, pikepdf.Array) else [str(f)]
 
 def why_skip(o):
-    for k in ("/SMask", "/Mask", "/Decode"):
+    for k in ("/Mask", "/Decode"):
         if k in o: return f"has {k}"
     if o.get("/ImageMask", False): return "image mask"
     if o.get("/ColorSpace") != N.DeviceRGB: return f"colorspace {o.get('/ColorSpace')!r}"[:60]
@@ -187,6 +193,43 @@ def convert(o, dct_tol):
     o.ColorSpace = N.DeviceGray
     return "ok", "dct", old, len(gj), f"chroma diff {cd}, max diff vs G {md}"
 
+_W = {}
+def _work(args):
+    """Worker: convert one image in a private copy of the PDF; return picklable result."""
+    src, og, bits, dct_tol, palette, min_frac, max_err = args
+    if _W.get("src") != src: _W.clear(); _W["src"] = src; _W["pdf"] = pikepdf.open(src)
+    o = _W["pdf"].get_object(og)
+    st, kind, old, new, info = (convert4(o, dct_tol, palette, min_frac) if bits == 4 else convert(o, dct_tol))
+    if st == "ok" and max_err is not None and bits == 4:
+        import re
+        m = re.search(r"max err (\d+)", info)
+        if m and int(m.group(1)) > max_err:
+            return og, "skip", kind, old, old, f"max err {m.group(1)} > --max-err {max_err}", None
+    if st != "ok": return og, st, kind, old, new, info, None
+    dp = o.get("/DecodeParms"); cs = o.ColorSpace
+    cs = str(cs) if isinstance(cs, pikepdf.Name) else (int(cs[2]), bytes(cs[3]))
+    upd = dict(data=o.read_raw_bytes(), filter=str(o.Filter),
+               dp=None if dp is None else {k: int(v) for k, v in dp.items()},
+               cs=cs, bpc=int(o.BitsPerComponent))
+    return og, st, kind, old, new, info, upd
+
+def _apply(o, u):
+    if "/DecodeParms" in o: del o["/DecodeParms"]
+    dp = None if u["dp"] is None else pikepdf.Dictionary({k: v for k, v in u["dp"].items()})
+    o.write(u["data"], filter=N(u["filter"]), decode_parms=dp)
+    o.ColorSpace = N(u["cs"]) if isinstance(u["cs"], str) else pikepdf.Array(
+        [N.Indexed, N.DeviceRGB, u["cs"][0], pikepdf.String(u["cs"][1])])
+    o.BitsPerComponent = u["bpc"]
+
+def fix_smask_matte(o):
+    """After parent -> DeviceGray, /Matte on its soft-mask must have 1 component."""
+    if o.get("/ColorSpace") != N.DeviceGray: return
+    sm = o.get("/SMask")
+    if sm is None or not isinstance(sm, pikepdf.Stream) or "/Matte" not in sm: return
+    m = [float(x) for x in sm.Matte]
+    if len(m) == 3: sm.Matte = [m[1]]
+    elif len(m) != 1: sm.Matte = [m[0]]
+
 def main(argv=None):
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("src"); p.add_argument("out")
@@ -194,17 +237,39 @@ def main(argv=None):
     p.add_argument("--palette", action="store_true", help="with --bits 4: Indexed RGB for color images (lossy)")
     p.add_argument("--min-frac", type=float, default=1e-4, help="palette: colors below this pixel fraction are remapped")
     p.add_argument("--bits", type=int, choices=(8, 4), default=8, help="8 = lossless (default); 4 = lossy 16-level")
+    p.add_argument("--max-err", type=int, default=None, help="with --bits 4: leave an image unchanged if its max error would exceed N")
+    p.add_argument("-j", "--jobs", type=int, default=os.cpu_count() or 1, help="worker processes (default: cores); output identical to -j 1")
     a = p.parse_args(argv)
     if a.palette and a.bits != 4: p.error("--palette requires --bits 4")
     if os.path.abspath(a.src) == os.path.abspath(a.out): p.error("refusing to overwrite input")
     if os.path.exists(a.out): p.error(f"{a.out} exists; refusing to overwrite")
     pdf = pikepdf.open(a.src)
+    imgs = [o for o in pdf.objects if isinstance(o, pikepdf.Stream) and o.get("/Subtype") == N.Image]
+    smask_ogs = set()
+    for o in imgs:
+        sm = o.get("/SMask")
+        if isinstance(sm, pikepdf.Stream):
+            try: smask_ogs.add(sm.objgen)
+            except Exception: pass
+    jobs, preset = [], {}
+    for o in imgs:
+        if o.objgen in smask_ogs:
+            old = len(o.read_raw_bytes())
+            preset[o.objgen] = (o.objgen, "skip", "-", old, old, "soft-mask stream (left 8-bit)", None)
+        else:
+            jobs.append((a.src, o.objgen, a.bits, a.dct_tol, a.palette, a.min_frac, a.max_err))
+    if a.jobs > 1 and len(jobs) > 1:
+        import multiprocessing as mp
+        with mp.get_context("fork").Pool(min(a.jobs, len(jobs))) as pool: worked = pool.map(_work, jobs, chunksize=1)
+    else:
+        _W.clear(); worked = [_work(j) for j in jobs]; _W.clear()
+    by_og = {r[0]: r for r in worked}; by_og.update(preset)
     tot = {}; skipped = 0
-    for o in pdf.objects:
-        if not isinstance(o, pikepdf.Stream) or o.get("/Subtype") != N.Image: continue
-        st, kind, old, new, info = (convert4(o, a.dct_tol, a.palette, a.min_frac) if a.bits == 4 else convert(o, a.dct_tol))
-        print(f"obj {o.objgen[0]}: {int(o.Width)}x{int(o.Height)} {kind} {st} {old} -> {new} ({info})", flush=True)
+    for o in imgs:
+        og, st, kind, old, new, info, upd = by_og[o.objgen]
+        print(f"obj {og[0]}: {int(o.Width)}x{int(o.Height)} {kind} {st} {old} -> {new} ({info})", flush=True)
         if st == "skip": skipped += 1; continue
+        _apply(o, upd); fix_smask_matte(o)
         t = tot.setdefault(kind, [0, 0, 0]); t[0] += 1; t[1] += old; t[2] += new
     for k, (n, o_, n_) in tot.items():
         print(f"total {k}: {n} images {o_} -> {n_} bytes (saved {o_ - n_}, {100*(o_-n_)/max(o_,1):.1f}%)")
