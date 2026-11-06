@@ -1,6 +1,6 @@
 import subprocess, sys, pathlib, numpy as np, pikepdf
 from PIL import Image
-TOOL = pathlib.Path(__file__).parent.parent / "pdf-fill-speckle.py"
+TOOL = pathlib.Path(__file__).parent.parent / "pdf-fill-solid.py"
 def make_pdf(path, n=3):
     pdf = pikepdf.new()
     for k in range(n):

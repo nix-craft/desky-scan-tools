@@ -17,7 +17,7 @@ original edge row; curves/corners/diagonals fail the straight-row test.
 PDF in -> PDF out: only image XObject streams are swapped (lossless JBIG2,
 `jbig2 -p` generic region); page boxes, content streams, matrices untouched.
 PNG/TIFF in -> PNG/TIFF out (TIFF written with Group 4).
-Usage: pdf-fill-speckle.py IN OUT [--max-hole N] [--surround R] [--density D]
+Usage: pdf-fill-solid.py IN OUT [--max-hole N] [--surround R] [--density D]
                            [--window W] [--dpi D] [--dry-run]
                            [--no-edges] [--edge-min-run N] [--edge-max-notch N]
                            [--no-bumps] [--edge-passes N] [-j N]
